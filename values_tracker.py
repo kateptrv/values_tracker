@@ -1,35 +1,40 @@
-
 """
-Daily Values Journal – **Per-User Version**
+Daily Values Journal – No‑Dependency Auth
 ========================================
-A Streamlit app that lets **each authenticated user** keep a private journal tagged with personal values.
+A Streamlit app for private journaling and value tracking.  
+Uses **only built‑in Streamlit widgets + SQLite + bcrypt** for authentication—no external auth library that might break.
 
 Features
 --------
-1. **Secure login** (username + password) via *streamlit-authenticator*.
-2. **Add Entry** – write text, tag it with one or more core values, rate each 0-99.
-3. **Dashboard** – bar-chart of your own values for Last 1 day / 7 days / 30 days / All time.
-4. **Data isolation** – each user’s entries live in the same SQLite DB but are filtered by `username`, so no one else can read them.
+* **Register / log in** (bcrypt‑hashed passwords stored locally)  
+* **Add journal entry** – tag with values, rate each 0‑99  
+* **Dashboard** – average rating per value for last 1/7/30 days or all time  
+* Each user sees **only their own** data  
 
-Run
----
+Install & run
+-------------
 ```bash
-pip install streamlit pandas streamlit-authenticator pyyaml bcrypt
+python3 -m venv venv && source venv/bin/activate
+pip install streamlit pandas bcrypt
 streamlit run value_tracker.py
 ```
-Default demo credentials → **user:** `demo`  **pass:** `demo`  (edit in code or YAML for production!)
+A default account **demo / demo** is created automatically if no users exist.
 """
 
 from __future__ import annotations
-import streamlit as st
-import pandas as pd
 import sqlite3
 from datetime import datetime, timedelta
-import streamlit_authenticator as stauth
 from pathlib import Path
-import yaml
 
+import bcrypt
+import pandas as pd
+import streamlit as st
+
+###############################################################################
+# Config
+###############################################################################
 DB_PATH = "values_journal.db"
+USERS_TABLE = "users"
 
 VALUE_OPTIONS = [
     'Connection', 'Interpersonal Harmony', 'Collaboration', 'Community', 'Integrity',
@@ -41,193 +46,195 @@ VALUE_OPTIONS = [
 ]
 
 ###############################################################################
-# Authentication helpers                                                      #
+# Database helpers
 ###############################################################################
 
-CRED_FILE = Path("credentials.yaml")
+def get_conn():
+    return sqlite3.connect(DB_PATH, check_same_thread=False)
 
-# ---------------------------------------------------------------------------
-# If no credentials file exists, create a default demo login (demo/demo)
-# ---------------------------------------------------------------------------
-if not CRED_FILE.exists():
-    demo_config = {
-        "credentials": {
-            "usernames": {
-                "demo": {
-                    "email": "demo@example.com",
-                    "name": "Demo User",
-                    "password": stauth.Hasher(["demo"]).generate()[0],  # hashed
-                }
-            }
-        },
-        "cookie": {"expiry_days": 30, "key": "values_journal_cookie"},
-        "preauthorized": {"emails": []},
-    }
-    with CRED_FILE.open("w") as f:
-        yaml.dump(demo_config, f)
 
-with CRED_FILE.open() as f:
-    config = yaml.safe_load(f)
+def _ensure_column(cur, table: str, column_def: str):
+    """Add *column_def* to *table* if it doesn't already exist."""
+    name = column_def.split()[0]
+    cols = [row[1] for row in cur.execute(f"PRAGMA table_info({table})")]  # colname at idx 1
+    if name not in cols:
+        cur.execute(f"ALTER TABLE {table} ADD COLUMN {column_def}")
 
-authenticator = stauth.Authenticate(
-    config,
-    "values_journal",      # cookie name
-    "auth",                # signature key (any string)
-    cookie_expiry_days=30,
-)
-
-name, auth_status, username = authenticator.login("Login", "sidebar")
-
-if auth_status is False:
-    st.error("Username or password is incorrect")
-    st.stop()
-elif auth_status is None:
-    st.warning("Please enter your username and password")
-    st.stop()
-
-# If here → authenticated
-authenticator.logout("Logout", "sidebar")
-
-###############################################################################
-# Database helpers                                                            #
-###############################################################################
 
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     cur = conn.cursor()
-    # Entries table has username column for access control
-    cur.execute(
-        """CREATE TABLE IF NOT EXISTS entries (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                ts TEXT NOT NULL,
-                username TEXT NOT NULL,
-                text TEXT NOT NULL
-        )"""
-    )
-    cur.execute(
-        """CREATE TABLE IF NOT EXISTS tags (
-                entry_id INTEGER,
-                value TEXT,
-                rating INTEGER,
-                FOREIGN KEY(entry_id) REFERENCES entries(id)
-        )"""
-    )
+
+    # Users
+    cur.execute(f"""CREATE TABLE IF NOT EXISTS {USERS_TABLE} (
+        username TEXT PRIMARY KEY,
+        pwd_hash TEXT NOT NULL
+    )""")
+
+    # Entries
+    cur.execute("""CREATE TABLE IF NOT EXISTS entries (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts TEXT NOT NULL,
+        text TEXT NOT NULL
+    )""")
+    # Ensure newer columns exist (username)
+    _ensure_column(cur, "entries", "username TEXT")
+
+    # Tags
+    cur.execute("""CREATE TABLE IF NOT EXISTS tags (
+        entry_id INTEGER,
+        value TEXT,
+        rating INTEGER
+    )""")
+    # Ensure FK columns if DB created early
+    _ensure_column(cur, "tags", "rating INTEGER")
+    _ensure_column(cur, "tags", "value TEXT")
+
     conn.commit()
+
+    # Ensure default demo user
+    if not cur.execute(f"SELECT 1 FROM {USERS_TABLE} LIMIT 1").fetchone():
+        demo_hash = bcrypt.hashpw(b"demo", bcrypt.gensalt()).decode()
+        cur.execute(f"INSERT INTO {USERS_TABLE} (username, pwd_hash) VALUES (?, ?)", ("demo", demo_hash))
+        conn.commit()
     conn.close()
 
+###############################################################################
+# Auth helpers
+###############################################################################
 
-def add_entry(entry_text: str, value_ratings: dict[str, int]):
-    """Insert a journal entry plus its value tags for current user."""
-    ts = datetime.utcnow().isoformat()
-    conn = sqlite3.connect(DB_PATH)
+def verify_user(username: str, password: str) -> bool:
+    conn = get_conn()
     cur = conn.cursor()
-    cur.execute(
-        "INSERT INTO entries (ts, username, text) VALUES (?, ?, ?)",
-        (ts, username, entry_text),
-    )
-    entry_id = cur.lastrowid
-    for value, rating in value_ratings.items():
-        cur.execute(
-            "INSERT INTO tags (entry_id, value, rating) VALUES (?, ?, ?)",
-            (entry_id, value, rating),
-        )
-    conn.commit()
+    row = cur.execute(f"SELECT pwd_hash FROM {USERS_TABLE} WHERE username=?", (username,)).fetchone()
     conn.close()
-    st.cache_data.clear()   # refresh cached reads
+    if not row:
+        return False
+    return bcrypt.checkpw(password.encode(), row[0].encode())
 
 
-@st.cache_data(show_spinner=False, ttl=0)
-def load_data():
-    """Return (entries_df, tags_df) for current user only."""
-    conn = sqlite3.connect(DB_PATH)
-    entries = pd.read_sql_query(
-        "SELECT * FROM entries WHERE username = ?", conn, params=(username,), parse_dates=["ts"]
-    )
-    if entries.empty:
+def register_user(username: str, password: str) -> bool:
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute(f"INSERT INTO {USERS_TABLE} (username, pwd_hash) VALUES (?, ?)",
+                    (username, bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()))
+        conn.commit()
+        return True
+    except sqlite3.IntegrityError:
+        return False
+    finally:
         conn.close()
-        return entries, pd.DataFrame(columns=["entry_id", "value", "rating"])
 
-    tags = pd.read_sql_query(
-        "SELECT * FROM tags WHERE entry_id IN (SELECT id FROM entries WHERE username = ?)",
-        conn,
-        params=(username,),
-    )
+###############################################################################
+# Entry CRUD
+###############################################################################
+
+def add_entry(user: str, text: str, ratings: dict[str, int]):
+    conn = get_conn()
+    cur = conn.cursor()
+    ts = datetime.utcnow().isoformat()
+    cur.execute("INSERT INTO entries (ts, username, text) VALUES (?,?,?)", (ts, user, text))
+    entry_id = cur.lastrowid
+    for val, rating in ratings.items():
+        cur.execute("INSERT INTO tags (entry_id, value, rating) VALUES (?,?,?)", (entry_id, val, rating))
+    conn.commit()
+    conn.close()
+    st.cache_data.clear()
+
+
+def load_user_data(user: str):
+    conn = get_conn()
+    entries = pd.read_sql_query("SELECT * FROM entries WHERE username=?", conn, params=(user,), parse_dates=["ts"])
+    tags = pd.read_sql_query("SELECT * FROM tags WHERE entry_id IN (SELECT id FROM entries WHERE username=?)", conn, params=(user,))
     conn.close()
     return entries, tags
 
 ###############################################################################
-# UI                                                                          #
+# UI: Auth screens
 ###############################################################################
 
-def dashboard():
-    entries, tags = load_data()
-
-    if entries.empty:
-        st.info("No entries yet – add one first!")
-        return
-
-    timeframe = st.selectbox(
-        "Choose time window", ("Last 1 day", "Last 7 days", "Last 30 days", "All time")
-    )
-    now = datetime.utcnow()
-    if timeframe == "Last 1 day":
-        start_ts = now - timedelta(days=1)
-    elif timeframe == "Last 7 days":
-        start_ts = now - timedelta(days=7)
-    elif timeframe == "Last 30 days":
-        start_ts = now - timedelta(days=30)
+def auth_sidebar():
+    st.sidebar.header("Account")
+    if "user" not in st.session_state:
+        login_tab, register_tab = st.sidebar.tabs(["Login", "Register"])
+        with login_tab:
+            u = st.text_input("Username", key="login_user")
+            p = st.text_input("Password", type="password", key="login_pwd")
+            if st.button("Login"):
+                if verify_user(u, p):
+                    st.session_state.user = u
+                    st.success("Logged in!")
+                    st.rerun()
+                else:
+                    st.error("Invalid credentials")
+        with register_tab:
+            nu = st.text_input("New username", key="reg_user")
+            np = st.text_input("New password", type="password", key="reg_pwd")
+            if st.button("Register"):
+                if register_user(nu, np):
+                    st.success("User created. You can log in now.")
+                else:
+                    st.error("Username already exists")
     else:
-        start_ts = entries["ts"].min()
+        st.sidebar.markdown(f"**Logged in as {st.session_state.user}**")
+        if st.sidebar.button("Logout"):
+            st.session_state.clear()
+            st.rerun()
 
-    recent_entries = entries[entries["ts"] >= pd.Timestamp(start_ts)]
-    recent_tags = tags[tags["entry_id"].isin(recent_entries["id"])]
+###############################################################################
+# UI pages (require login)
+###############################################################################
 
-    if recent_tags.empty:
-        st.info("No tagged values in the selected period.")
-        return
-
-    recent_tags["rating"].fillna(50, inplace=True)
-    agg = (
-        recent_tags.groupby("value")["rating"]
-        .mean()
-        .round(1)
-        .sort_values(ascending=False)
-    )
-
-    st.subheader("Average value rating (higher = more salient)")
-    st.bar_chart(agg)
-    st.dataframe(agg.rename("avg_rating"))
-
-
-def entry_form():
+def page_add(user: str):
     st.subheader("New Journal Entry")
-    entry_text = st.text_area("Write your entry", height=200)
-    selected_values = st.multiselect("Tag with values", VALUE_OPTIONS)
-
-    ratings: dict[str, int] = {}
-    if selected_values:
-        st.write("Rate how strongly each value featured (0-99):")
-        for val in selected_values:
-            ratings[val] = st.slider(val, 0, 99, 50, key=val)
-
-    if st.button("Save Entry") and entry_text.strip():
-        add_entry(entry_text, ratings)
-        st.success("Entry saved!")
+    text = st.text_area("Entry text", height=200)
+    chosen = st.multiselect("Tag with values", VALUE_OPTIONS)
+    ratings = {val: st.slider(val, 0, 99, 50, key=val) for val in chosen}
+    if st.button("Save") and text.strip():
+        add_entry(user, text, ratings)
+        st.success("Saved!")
         st.rerun()
 
 
-def main():
-    st.title("Daily Values Journal – Private")
-    st.markdown(f"**Logged in as:** {name}  ")
-
-    menu = st.sidebar.radio("Navigate", ("Add entry", "Dashboard"))
-
-    if menu == "Add entry":
-        entry_form()
+def page_dashboard(user: str):
+    entries, tags = load_user_data(user)
+    if entries.empty:
+        st.info("No entries yet – add one first!")
+        return
+    window = st.selectbox("Window", ("Last 1 day", "Last 7 days", "Last 30 days", "All time"))
+    now = datetime.utcnow()
+    if window == "Last 1 day":
+        start = now - timedelta(days=1)
+    elif window == "Last 7 days":
+        start = now - timedelta(days=7)
+    elif window == "Last 30 days":
+        start = now - timedelta(days=30)
     else:
-        dashboard()
+        start = entries["ts"].min()
+    recent_entries = entries[entries["ts"] >= pd.Timestamp(start)]
+    recent_tags = tags[tags["entry_id"].isin(recent_entries["id"])]
+    if recent_tags.empty:
+        st.info("No tagged values in selected window.")
+        return
+    recent_tags["rating"].fillna(50, inplace=True)
+    agg = recent_tags.groupby("value")["rating"].mean().round(1).sort_values(ascending=False)
+    st.bar_chart(agg)
+    st.dataframe(agg.rename("avg_rating"))
 
+###############################################################################
+# Main
+###############################################################################
 
-if __name__ == "__main__":
-    init_db()
-    main()
+init_db()
+auth_sidebar()
+
+if "user" in st.session_state:
+    st.title("Daily Values Journal – Private")
+    page = st.sidebar.radio("Navigate", ("Add entry", "Dashboard"))
+    if page == "Add entry":
+        page_add(st.session_state.user)
+    else:
+        page_dashboard(st.session_state.user)
+else:
+    st.title("Please log in or register")
