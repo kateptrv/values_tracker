@@ -95,14 +95,34 @@ def ensure_schema():
 
 # ------------------ Auth helpers ------------------
 
-def verify(u,p):
-    row = conn().execute(f"SELECT pwd_hash FROM {USERS_TABLE} WHERE username=?",(u,)).fetchone()
-    return bool(row and bcrypt.checkpw(p.encode(), row[0].encode()))
-
-def register(u,p):
+def verify(u, p):
+    """Check if username/password are correct."""
+    u = u.strip()
+    p = p.strip()
     try:
-        conn().execute(f"INSERT INTO {USERS_TABLE} VALUES (?,?)", (u, bcrypt.hashpw(p.encode(), bcrypt.gensalt()).decode())); conn().commit(); return True
+        c = conn()
+        row = c.execute(f"SELECT pwd_hash FROM {USERS_TABLE} WHERE username=?", (u,)).fetchone()
+        c.close()
+        return bool(row and bcrypt.checkpw(p.encode(), row[0].encode()))
+    except Exception as e:
+        st.error(f"Verification error: {e}")
+        return False
+
+def register(u, p):
+    """Register a new user with a securely hashed password."""
+    u = u.strip()
+    p = p.strip()
+    try:
+        hashed = bcrypt.hashpw(p.encode(), bcrypt.gensalt()).decode()
+        c = conn()
+        c.execute(f"INSERT INTO {USERS_TABLE} VALUES (?, ?)", (u, hashed))
+        c.commit()
+        c.close()
+        return True
     except sqlite3.IntegrityError:
+        return False
+    except Exception as e:
+        st.error(f"Registration error: {e}")
         return False
 
 # ------------------ CRUD ------------------
