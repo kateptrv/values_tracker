@@ -107,9 +107,19 @@ def register(u,p):
 
 # ------------------ CRUD ------------------
 
-def add_entry(user,text,ratings):
-    c=conn();cur=c.cursor();ts=datetime.utcnow().isoformat();cur.execute("INSERT INTO entries (ts,text,username) VALUES (?,?,?)",(ts,text,user));eid=cur.lastrowid
-    for v,r in ratings.items():cur.execute("INSERT INTO tags VALUES (?,?,?)",(eid,v,r));c.commit();c.close();st.cache_data.clear()
+def add_entry(user, text, ratings):
+    c = conn()
+    cur = c.cursor()
+    ts = datetime.utcnow().isoformat()
+    cur.execute("INSERT INTO entries (ts, text, username) VALUES (?, ?, ?)", (ts, text, user))
+    eid = cur.lastrowid
+
+    for v, r in ratings.items():
+        cur.execute("INSERT INTO tags VALUES (?, ?, ?)", (eid, v, r))
+
+    c.commit()
+    c.close()
+    st.cache_data.clear()
 
 def load(user):
     c=conn();e=pd.read_sql_query("SELECT * FROM entries WHERE username=?",c,params=(user,),parse_dates=["ts"]);t=pd.read_sql_query("SELECT * FROM tags WHERE entry_id IN (SELECT id FROM entries WHERE username=?)",c,params=(user,));c.close();return e,t
@@ -142,15 +152,105 @@ def page_add(user):
     if st.button("Save") and txt.strip():add_entry(user,txt,ratings);st.success("Saved");st.rerun()
 
 def page_dash(user):
-    e,t=load(user);
-    if e.empty:st.info("No entries yet");return
-    win=st.selectbox("Window",("Last 1 day","Last 7 days","Last 30 days","All time"));now=datetime.utcnow()
-    start={"Last 1 day":now-timedelta(days=1),"Last 7 days":now-timedelta(days=7),"Last 30 days":now-timedelta(days=30),"All time":e["ts"].min()}[win]
-    recent=e[e["ts"]>=pd.Timestamp(start)];tag=t[t["entry_id"].isin(recent["id"])]
-    if tag.empty:st.info("No tags in window");return
-    tag["rating"].fillna(50,inplace=True)
-    agg=tag.groupby("value")["rating"].mean().round(1).sort_values(ascending=False)
-    st.bar_chart(agg);st.dataframe(agg.rename("avg_rating"))
+    """Dashboard page – either bar chart of averages or multi-line time series."""
+    e, t = load(user)
+    if e.empty:
+        st.info("No entries yet.")
+        return
+
+    # ────── choose chart type ──────
+    chart_type = st.radio(
+        "Chart type",
+        ("Average ratings (bar)", "Time series (line)"),
+        horizontal=True,
+    )
+
+    # ---------------- BAR CHART ----------------
+    if chart_type == "Average ratings (bar)":
+        win = st.selectbox(
+            "Window",
+            ("Last 1 day", "Last 7 days", "Last 30 days", "All time"),
+        )
+        now = datetime.utcnow()
+        start = {
+            "Last 1 day": now - timedelta(days=1),
+            "Last 7 days": now - timedelta(days=7),
+            "Last 30 days": now - timedelta(days=30),
+            "All time": e["ts"].min(),
+        }[win]
+
+        recent = e[e["ts"] >= pd.Timestamp(start)]
+        tag = t[t["entry_id"].isin(recent["id"])]
+        if tag.empty:
+            st.info("No tags in this window.")
+            return
+
+        tag["rating"].fillna(50, inplace=True)
+        agg = (
+            tag.groupby("value")["rating"]
+            .mean()
+            .round(1)
+            .sort_values(ascending=False)
+        )
+        st.bar_chart(agg)
+        st.dataframe(agg.rename("avg_rating"))
+
+    # ---------------- LINE CHART ----------------
+    else:
+        # date-range picker
+        min_date = e["ts"].min().date()
+        max_date = e["ts"].max().date()
+        start_date, end_date = st.date_input(
+            "Select date range",
+            (min_date, max_date),
+            min_value=min_date,
+            max_value=max_date,
+        )
+
+        if start_date > end_date:
+            st.error("Start date must not be after end date.")
+            return
+
+        # value selector
+        value_sel = st.multiselect(
+            "Values to plot",
+            VALUE_OPTIONS,
+            default=[],
+            help="Add as many values as you like; each becomes a coloured line.",
+        )
+        if not value_sel:
+            st.info("Choose at least one value.")
+            return
+
+        # filter entries & tags to the chosen window
+        mask = (e["ts"].dt.date >= start_date) & (e["ts"].dt.date <= end_date)
+        entries_win = e.loc[mask]
+        if entries_win.empty:
+            st.info("No entries in this date range.")
+            return
+
+        merged = (
+            t[t["entry_id"].isin(entries_win["id"])]
+            .merge(entries_win[["id", "ts"]], left_on="entry_id", right_on="id")
+            .query("value in @value_sel")
+        )
+
+        if merged.empty:
+            st.info("Selected values aren’t present in this range.")
+            return
+
+        # aggregate: daily mean rating per value
+        merged["date"] = merged["ts"].dt.date
+        daily = (
+            merged.groupby(["date", "value"])["rating"]
+            .mean()
+            .unstack("value")
+            .sort_index()
+        )
+
+        # show chart & table
+        st.line_chart(daily)          # Streamlit handles colours automatically
+        st.dataframe(daily.round(1))
 
 def page_defs():
     st.subheader("Core Value Definitions")
